@@ -61,6 +61,14 @@ pub enum StorageKey {
     RateLimitState(Address),
     /// Per-attestor rate-limit configuration override (persistent).
     RateLimitOverride(Address),
+    /// Singleton yield farm reward accumulator state (persistent).
+    YieldFarmState,
+    /// Per-farmer yield farm stake and reward checkpoint (persistent).
+    FarmerPosition(Address),
+    /// Whether an address is allowed to publish through the Event Hub (persistent).
+    EventHubPublisher(Address),
+    /// Event Hub message by ID (persistent).
+    EventHubMessage(u64),
     // --- Instance-storage counters (stored as Vec<Symbol> keys) ---
     // These are kept as plain symbol_short! vecs because instance storage
     // requires a Vec<Symbol> key; they are defined as named constants below.
@@ -96,4 +104,7 @@ pub fn key_health_threshold(env: &Env) -> Vec<Symbol> {
 }
 pub fn key_replay_window(env: &Env) -> Vec<Symbol> {
     soroban_sdk::vec![env, symbol_short!("RPWINDOW")]
+}
+pub fn key_event_hub_counter(env: &Env) -> Vec<Symbol> {
+    soroban_sdk::vec![env, symbol_short!("EVTHUBCNT")]
 }

@@ -6,6 +6,7 @@
 
 extern crate alloc;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::errors::{Error, ErrorCode};
@@ -304,14 +305,12 @@ pub fn initiate_deposit(raw: RawDepositResponse, asset_code: &str) -> Result<Dep
 
     Ok(DepositResponse {
         transaction_id: raw.transaction_id,
-        how: Some(raw.how),
+        how: raw.how,
         extra_info: raw.extra_info,
-        deposit_address: None,
         min_amount: raw.min_amount,
         max_amount: raw.max_amount,
         fee_fixed: raw.fee_fixed,
         fee_percent: raw.fee_percent,
-        expires_at: None,
         status: raw
             .status
             .as_deref()
@@ -340,7 +339,7 @@ pub fn initiate_withdrawal(raw: RawWithdrawalResponse, asset_code: &str) -> Resu
 
     Ok(WithdrawalResponse {
         transaction_id: raw.transaction_id,
-        account_id: Some(raw.account_id),
+        account_id: raw.account_id,
         dest_account_id: raw.dest_account_id,
         memo: raw.memo,
         memo_type: raw.memo_type,
@@ -348,7 +347,6 @@ pub fn initiate_withdrawal(raw: RawWithdrawalResponse, asset_code: &str) -> Resu
         max_amount: raw.max_amount,
         fee_fixed: raw.fee_fixed,
         fee_percent: raw.fee_percent,
-        estimated_completion: None,
         status: raw
             .status
             .as_deref()

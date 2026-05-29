@@ -10,7 +10,7 @@ use crate::storage::{
     StorageKey,
     key_admin, key_counter, key_session_counter, key_quote_counter,
     key_audit_counter, key_anchor_list, key_health_threshold, key_replay_window,
-    key_audit_log_offset,
+    key_audit_log_offset, key_event_hub_counter,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,8 +19,9 @@ use crate::storage::{
 
 pub use crate::types::{
     AnchorMetadata, AnchorServices, AssetInfo, Attestation, AuditLog, CapabilitiesCache,
-    CachedToml, FiatCurrency, HealthStatus, MetadataCache, OperationContext, Quote, RequestId,
-    RoutingOptions, RoutingRequest, Session, StellarToml, TracingSpan,
+    CachedToml, EventHubMessage, FarmerPosition, FiatCurrency, HealthStatus, MetadataCache,
+    OperationContext, Quote, RequestId, RewardClaim, RoutingOptions, RoutingRequest, Session,
+    StellarToml, TracingSpan, YieldFarmState,
     SERVICE_DEPOSITS, SERVICE_WITHDRAWALS, SERVICE_QUOTES, SERVICE_KYC, ServiceType,
 };
 
@@ -126,6 +127,28 @@ struct AttestorRegistered(Address);
 #[derive(Clone)]
 struct AttestorRevoked(Address);
 
+#[contracttype]
+#[derive(Clone)]
+struct YieldFarmConfigured {
+    reward_rate: u128,
+    period_finish: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+struct YieldFarmStakeChanged {
+    farmer: Address,
+    amount: u128,
+    total_staked: u128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+struct EventHubAccessChanged {
+    publisher: Address,
+    allowed: bool,
+}
+
 // ---------------------------------------------------------------------------
 // TTLs (in ledgers)
 //
@@ -147,6 +170,8 @@ const INSTANCE_TTL: u32 = 518_400;
 const SESSION_TTL: u64 = 86_400;
 /// Session storage TTL in ledgers (~24 hours at 5s/ledger).
 const SESSION_LEDGER_TTL: u32 = 17_280;
+/// Fixed-point scale for reward-per-token accounting.
+const REWARD_SCALE: u128 = 1_000_000_000_000;
 
 fn pending_admin_key(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Symbol> {
     soroban_sdk::vec![env, symbol_short!("PADMIN")]
@@ -1308,7 +1333,8 @@ impl AnchorKitContract {
     pub fn get_cache_age_seconds(env: Env, anchor: Address) -> Result<u64, ErrorCode> {
         let key = StorageKey::MetadataCache(anchor);
         let entry: MetadataCache = env.storage().persistent().get(&key)
-            .or_else(|| env.storage().temporary().get(&key))?;
+            .or_else(|| env.storage().temporary().get(&key))
+            .ok_or(ErrorCode::CacheNotFound)?;
         let now = env.ledger().timestamp();
         Ok(now.saturating_sub(entry.cached_at))
     }
@@ -1751,7 +1777,7 @@ impl AnchorKitContract {
             candidates.push_back(quote);
 
             // Stop adding candidates if we've reached max_anchors limit
-            if options.max_anchors > 0 && candidates.len() >= options.max_anchors as usize {
+            if options.max_anchors > 0 && candidates.len() >= options.max_anchors {
                 break;
             }
         }
@@ -1873,6 +1899,201 @@ impl AnchorKitContract {
         );
 
         best
+    }
+
+    // -----------------------------------------------------------------------
+    // Yield Farming
+    // -----------------------------------------------------------------------
+
+    /// Configure the singleton yield farm emission schedule.
+    ///
+    /// Rewards use a global reward-per-token accumulator, so stake, withdraw,
+    /// claim, and schedule updates are O(1). Emissions that occur while
+    /// `total_staked == 0` are not retroactively assigned to later stakers.
+    pub fn configure_yield_farm(env: Env, reward_rate: u128, period_finish: u64) {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        if reward_rate == 0 || period_finish <= now {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
+        let mut state = Self::current_yield_farm_state(&env);
+        state = Self::updated_yield_farm_state(&env, state);
+        state.reward_rate = reward_rate;
+        state.last_update_time = now;
+        state.period_finish = period_finish;
+
+        Self::store_yield_farm_state(&env, &state);
+        env.events().publish(
+            (symbol_short!("yfarming"), symbol_short!("config")),
+            YieldFarmConfigured { reward_rate, period_finish },
+        );
+    }
+
+    pub fn get_yield_farm_state(env: Env) -> YieldFarmState {
+        Self::updated_yield_farm_state(&env, Self::current_yield_farm_state(&env))
+    }
+
+    pub fn get_farmer_position(env: Env, farmer: Address) -> FarmerPosition {
+        let state = Self::get_yield_farm_state(env.clone());
+        let position = Self::current_farmer_position(&env, &farmer);
+        Self::updated_farmer_position(&env, position, &state)
+    }
+
+    pub fn stake_yield_farm(env: Env, farmer: Address, amount: u128) -> FarmerPosition {
+        farmer.require_auth();
+        if amount == 0 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
+        let mut state = Self::updated_yield_farm_state(&env, Self::current_yield_farm_state(&env));
+        let mut position = Self::updated_farmer_position(
+            &env,
+            Self::current_farmer_position(&env, &farmer),
+            &state,
+        );
+
+        position.staked = position
+            .staked
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ValidationError));
+        state.total_staked = state
+            .total_staked
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::ValidationError));
+
+        Self::store_yield_farm_state(&env, &state);
+        Self::store_farmer_position(&env, &farmer, &position);
+        env.events().publish(
+            (symbol_short!("yfarming"), symbol_short!("stake")),
+            YieldFarmStakeChanged {
+                farmer,
+                amount,
+                total_staked: state.total_staked,
+            },
+        );
+        position
+    }
+
+    pub fn withdraw_yield_farm(env: Env, farmer: Address, amount: u128) -> FarmerPosition {
+        farmer.require_auth();
+        if amount == 0 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
+        let mut state = Self::updated_yield_farm_state(&env, Self::current_yield_farm_state(&env));
+        let mut position = Self::updated_farmer_position(
+            &env,
+            Self::current_farmer_position(&env, &farmer),
+            &state,
+        );
+        if amount > position.staked {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
+        position.staked -= amount;
+        state.total_staked -= amount;
+
+        Self::store_yield_farm_state(&env, &state);
+        Self::store_farmer_position(&env, &farmer, &position);
+        env.events().publish(
+            (symbol_short!("yfarming"), symbol_short!("withdraw")),
+            YieldFarmStakeChanged {
+                farmer,
+                amount,
+                total_staked: state.total_staked,
+            },
+        );
+        position
+    }
+
+    pub fn claim_yield_rewards(env: Env, farmer: Address) -> RewardClaim {
+        farmer.require_auth();
+
+        let state = Self::updated_yield_farm_state(&env, Self::current_yield_farm_state(&env));
+        let mut position = Self::updated_farmer_position(
+            &env,
+            Self::current_farmer_position(&env, &farmer),
+            &state,
+        );
+        let amount = position.pending_rewards;
+        position.pending_rewards = 0;
+
+        Self::store_yield_farm_state(&env, &state);
+        Self::store_farmer_position(&env, &farmer, &position);
+
+        let claim = RewardClaim {
+            farmer: farmer.clone(),
+            amount,
+            claimed_at: env.ledger().timestamp(),
+        };
+        env.events().publish(
+            (symbol_short!("yfarming"), symbol_short!("claim")),
+            claim.clone(),
+        );
+        claim
+    }
+
+    // -----------------------------------------------------------------------
+    // Event Hub
+    // -----------------------------------------------------------------------
+
+    pub fn set_event_hub_publisher(env: Env, publisher: Address, allowed: bool) {
+        Self::require_admin(&env);
+        let key = StorageKey::EventHubPublisher(publisher.clone());
+        if allowed {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        env.events().publish(
+            (symbol_short!("evthub"), symbol_short!("access")),
+            EventHubAccessChanged { publisher, allowed },
+        );
+    }
+
+    pub fn is_event_hub_publisher(env: Env, publisher: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&StorageKey::EventHubPublisher(publisher))
+            .unwrap_or(false)
+    }
+
+    pub fn publish_hub_event(
+        env: Env,
+        publisher: Address,
+        topic: String,
+        data: Bytes,
+    ) -> EventHubMessage {
+        Self::require_event_hub_publisher(&env, &publisher);
+        publisher.require_auth();
+        if topic.len() == 0 || data.len() == 0 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
+        let id = Self::next_event_hub_id(&env);
+        let message = EventHubMessage {
+            event_id: id,
+            publisher: publisher.clone(),
+            topic,
+            data,
+            published_at: env.ledger().timestamp(),
+        };
+        let key = StorageKey::EventHubMessage(id);
+        env.storage().persistent().set(&key, &message);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        env.events().publish(
+            (symbol_short!("evthub"), symbol_short!("publish"), publisher),
+            message.clone(),
+        );
+        message
+    }
+
+    pub fn get_hub_event(env: Env, event_id: u64) -> Option<EventHubMessage> {
+        env.storage()
+            .persistent()
+            .get::<_, EventHubMessage>(&StorageKey::EventHubMessage(event_id))
     }
 
     // -----------------------------------------------------------------------
@@ -2055,6 +2276,129 @@ impl AnchorKitContract {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    fn current_yield_farm_state(env: &Env) -> YieldFarmState {
+        env.storage()
+            .persistent()
+            .get::<_, YieldFarmState>(&StorageKey::YieldFarmState)
+            .unwrap_or_else(|| {
+                let now = env.ledger().timestamp();
+                YieldFarmState {
+                    total_staked: 0,
+                    reward_rate: 0,
+                    last_update_time: now,
+                    reward_per_token_stored: 0,
+                    period_finish: now,
+                }
+            })
+    }
+
+    fn updated_yield_farm_state(env: &Env, mut state: YieldFarmState) -> YieldFarmState {
+        let now = env.ledger().timestamp();
+        let applicable_time = if now < state.period_finish {
+            now
+        } else {
+            state.period_finish
+        };
+        if applicable_time <= state.last_update_time {
+            return state;
+        }
+
+        let elapsed = applicable_time - state.last_update_time;
+        state.last_update_time = applicable_time;
+
+        if state.total_staked == 0 || state.reward_rate == 0 {
+            return state;
+        }
+
+        let reward = (elapsed as u128)
+            .checked_mul(state.reward_rate)
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ValidationError));
+        let scaled_reward = reward
+            .checked_mul(REWARD_SCALE)
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ValidationError));
+        let increment = scaled_reward
+            .checked_div(state.total_staked)
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ValidationError));
+        state.reward_per_token_stored = state
+            .reward_per_token_stored
+            .checked_add(increment)
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ValidationError));
+        state
+    }
+
+    fn current_farmer_position(env: &Env, farmer: &Address) -> FarmerPosition {
+        env.storage()
+            .persistent()
+            .get::<_, FarmerPosition>(&StorageKey::FarmerPosition(farmer.clone()))
+            .unwrap_or(FarmerPosition {
+                staked: 0,
+                reward_per_token_paid: 0,
+                pending_rewards: 0,
+            })
+    }
+
+    fn updated_farmer_position(
+        env: &Env,
+        mut position: FarmerPosition,
+        state: &YieldFarmState,
+    ) -> FarmerPosition {
+        if state.reward_per_token_stored <= position.reward_per_token_paid {
+            position.reward_per_token_paid = state.reward_per_token_stored;
+            return position;
+        }
+
+        let delta = state.reward_per_token_stored - position.reward_per_token_paid;
+        let earned = position
+            .staked
+            .checked_mul(delta)
+            .and_then(|value| value.checked_div(REWARD_SCALE))
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ValidationError));
+        position.pending_rewards = position
+            .pending_rewards
+            .checked_add(earned)
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ValidationError));
+        position.reward_per_token_paid = state.reward_per_token_stored;
+        position
+    }
+
+    fn store_yield_farm_state(env: &Env, state: &YieldFarmState) {
+        env.storage()
+            .persistent()
+            .set(&StorageKey::YieldFarmState, state);
+        env.storage()
+            .persistent()
+            .extend_ttl(&StorageKey::YieldFarmState, PERSISTENT_TTL, PERSISTENT_TTL);
+    }
+
+    fn store_farmer_position(env: &Env, farmer: &Address, position: &FarmerPosition) {
+        let key = StorageKey::FarmerPosition(farmer.clone());
+        env.storage().persistent().set(&key, position);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+    }
+
+    fn require_event_hub_publisher(env: &Env, publisher: &Address) {
+        let allowed = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&StorageKey::EventHubPublisher(publisher.clone()))
+            .unwrap_or(false);
+        if !allowed {
+            panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
+        }
+    }
+
+    fn next_event_hub_id(env: &Env) -> u64 {
+        let inst = env.storage().instance();
+        let key = key_event_hub_counter(env);
+        let id: u64 = inst.get(&key).unwrap_or(0);
+        let next = id
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ValidationError));
+        inst.set(&key, &next);
+        inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+        id
+    }
+
     fn require_admin(env: &Env) {
         let admin: Address = env
             .storage()
@@ -2086,7 +2430,7 @@ impl AnchorKitContract {
             .get(&key_replay_window(env))
             .unwrap_or(300u64);
         let lower = now.saturating_sub(window);
-on this r        if timestamp < lower || timestamp > now {
+        if timestamp < lower || timestamp > now {
             panic_with_error!(env, ErrorCode::InvalidTimestamp);
         }
     }
@@ -2212,11 +2556,9 @@ fn verify_attestation_signature(
         }
         // Convert the key to BytesN<32>.
         let pk_n: BytesN<32> = key.clone().try_into().unwrap();
-        // Use the host environment's crypto verification.
-        if env.crypto().ed25519_verify(&pk_n, payload_hash, &sig_n) {
-            // Successful verification; exit the function.
-            return;
-        }
+        // `ed25519_verify` traps on invalid signatures and returns on success.
+        env.crypto().ed25519_verify(&pk_n, payload_hash, &sig_n);
+        return;
     }
 
     // If we reach this point, no key verified the signature.

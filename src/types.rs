@@ -391,3 +391,43 @@ pub struct HealthStatus {
     pub failure_count: u32,
     pub availability_percent: u32,
 }
+
+// ---------------------------------------------------------------------------
+// Yield farming and Event Hub types
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldFarmState {
+    pub total_staked: u128,
+    pub reward_rate: u128,
+    pub last_update_time: u64,
+    pub reward_per_token_stored: u128,
+    pub period_finish: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FarmerPosition {
+    pub staked: u128,
+    pub reward_per_token_paid: u128,
+    pub pending_rewards: u128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RewardClaim {
+    pub farmer: Address,
+    pub amount: u128,
+    pub claimed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct EventHubMessage {
+    pub event_id: u64,
+    pub publisher: Address,
+    pub topic: String,
+    pub data: Bytes,
+    pub published_at: u64,
+}

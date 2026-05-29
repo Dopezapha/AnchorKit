@@ -99,6 +99,10 @@ pub enum ErrorCode {
     SessionNotFound = 55,
     SessionExpired = 56,
     MissingSigningKey = 57,
+    NotInitialized = 58,
+    InvalidStrategy = 59,
+    AttestationLimitReached = 60,
+    UnauthorizedProposeAdmin = 61,
 }
 
 impl ErrorCode {
@@ -134,6 +138,9 @@ impl ErrorCode {
             ErrorCode::SessionNotFound => "Session not found",
             ErrorCode::SessionExpired => "Session has expired",
             ErrorCode::MissingSigningKey => "Anchor TOML does not publish a signing key",
+            ErrorCode::InvalidStrategy => "Routing strategy is invalid",
+            ErrorCode::AttestationLimitReached => "Attestation limit reached",
+            ErrorCode::UnauthorizedProposeAdmin => "Admin transfer proposal is not authorized",
         }
     }
 
@@ -223,6 +230,11 @@ impl AnchorKitError {
     pub fn cache_expired() -> Self { Self::from_code(ErrorCode::CacheExpired) }
     pub fn cache_not_found() -> Self { Self::from_code(ErrorCode::CacheNotFound) }
     pub fn missing_signing_key() -> Self { Self::from_code(ErrorCode::MissingSigningKey) }
+    pub fn audit_log_max_size_invalid() -> Self { Self::from_code(ErrorCode::AuditLogMaxSizeInvalid) }
+    pub fn unauthorized_propose_admin() -> Self { Self::from_code(ErrorCode::UnauthorizedProposeAdmin) }
+    pub fn no_pending_admin() -> Self { Self::from_code(ErrorCode::NoPendingAdmin) }
+    pub fn not_pending_admin() -> Self { Self::from_code(ErrorCode::NotPendingAdmin) }
+    pub fn path_traversal_detected() -> Self { Self::from_code(ErrorCode::InvalidEndpointFormat) }
 
     pub fn validation_error(context: &str) -> Self {
         Self::with_context(ErrorCode::ValidationError, ErrorCode::ValidationError.default_message(), context)
@@ -243,8 +255,14 @@ impl core::fmt::Display for AnchorKitError {
 // no-std / WASM implementation — zero heap allocation
 // ---------------------------------------------------------------------------
 
-    pub fn cache_not_found() -> Self {
-        Self::from_code(ErrorCode::CacheNotFound)
+#[cfg(not(feature = "std"))]
+impl AnchorKitError {
+    pub fn from_code(code: ErrorCode) -> Self {
+        AnchorKitError {
+            code,
+            message: code.default_message(),
+            context: None,
+        }
     }
 
     pub fn already_initialized() -> Self { Self::from_code(ErrorCode::AlreadyInitialized) }
@@ -269,6 +287,11 @@ impl core::fmt::Display for AnchorKitError {
     pub fn cache_expired() -> Self { Self::from_code(ErrorCode::CacheExpired) }
     pub fn cache_not_found() -> Self { Self::from_code(ErrorCode::CacheNotFound) }
     pub fn missing_signing_key() -> Self { Self::from_code(ErrorCode::MissingSigningKey) }
+    pub fn audit_log_max_size_invalid() -> Self { Self::from_code(ErrorCode::AuditLogMaxSizeInvalid) }
+    pub fn unauthorized_propose_admin() -> Self { Self::from_code(ErrorCode::UnauthorizedProposeAdmin) }
+    pub fn no_pending_admin() -> Self { Self::from_code(ErrorCode::NoPendingAdmin) }
+    pub fn not_pending_admin() -> Self { Self::from_code(ErrorCode::NotPendingAdmin) }
+    pub fn path_traversal_detected() -> Self { Self::from_code(ErrorCode::InvalidEndpointFormat) }
     pub fn validation_error(_context: &str) -> Self { Self::from_code(ErrorCode::ValidationError) }
 }
 
@@ -420,4 +443,3 @@ let codes = [
         assert_eq!(formatted, "[E15] Schema mismatch (field: transaction_id)");
     }
 }
-
